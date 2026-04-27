@@ -7,6 +7,7 @@ import net.portswigger.mcp.config.McpConfig
 import net.portswigger.mcp.providers.ClaudeDesktopProvider
 import net.portswigger.mcp.providers.ManualProxyInstallerProvider
 import net.portswigger.mcp.providers.ProxyJarManager
+import net.portswigger.mcp.tools.ScanTaskRegistry
 
 @Suppress("unused")
 class ExtensionBase : BurpExtension {
@@ -43,6 +44,8 @@ class ExtensionBase : BurpExtension {
         api.userInterface().registerSuiteTab("MCP", configUi.component)
 
         api.extension().registerUnloadingHandler {
+            ScanTaskRegistry.list().forEach { runCatching { it.task.delete() } }
+            ScanTaskRegistry.clear()
             serverManager.shutdown()
             configUi.cleanup()
             config.cleanup()

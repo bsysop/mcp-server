@@ -40,3 +40,8 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Local design docs (not for upstream) ###
+docs/MCP_FEATURES.md
+docs/SCANNER_SCOPE_PROPOSAL.md
+CLAUDE.md

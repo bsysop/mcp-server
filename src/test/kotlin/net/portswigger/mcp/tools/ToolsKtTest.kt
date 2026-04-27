@@ -14,6 +14,12 @@ import burp.api.montoya.logging.Logging
 import burp.api.montoya.persistence.PersistedObject
 import burp.api.montoya.proxy.Proxy
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
+import burp.api.montoya.scanner.AuditConfiguration
+import burp.api.montoya.scanner.Crawl
+import burp.api.montoya.scanner.CrawlConfiguration
+import burp.api.montoya.scanner.Scanner
+import burp.api.montoya.scanner.audit.Audit
+import burp.api.montoya.scope.Scope
 import burp.api.montoya.utilities.Base64Utils
 import burp.api.montoya.utilities.RandomUtils
 import burp.api.montoya.utilities.URLUtils
@@ -27,13 +33,17 @@ import io.modelcontextprotocol.kotlin.sdk.TextContent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.put
 import net.portswigger.mcp.KtorServerManager
 import net.portswigger.mcp.ServerState
 import net.portswigger.mcp.TestSseMcpClient
 import net.portswigger.mcp.config.McpConfig
 import net.portswigger.mcp.schema.HttpRequestResponse
 import net.portswigger.mcp.schema.toSerializableForm
+import net.portswigger.mcp.security.HttpRequestSecurity
+import net.portswigger.mcp.security.UserApprovalHandler
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
@@ -50,11 +60,12 @@ class ToolsKtTest {
     private val testPort = findAvailablePort()
     private var serverStarted = false
     private val config: McpConfig
+    private val persistedObject: PersistedObject
     private val mockHeaders = mutableListOf<HttpHeader>()
     private val capturedRequest = slot<HttpRequest>()
 
     init {
-        val persistedObject = mockk<PersistedObject>().apply {
+        persistedObject = mockk<PersistedObject>().apply {
             every { getBoolean("enabled") } returns true
             every { getBoolean("configEditingTooling") } returns true
             every { getBoolean("requireHttpRequestApproval") } returns false
@@ -62,7 +73,7 @@ class ToolsKtTest {
             every { getBoolean("_alwaysAllowHttpHistory") } returns false
             every { getBoolean("_alwaysAllowWebSocketHistory") } returns false
             every { getString("host") } returns "127.0.0.1"
-            every { getString("autoApproveTargets") } returns ""
+            every { getString("_autoApproveTargets") } returns ""
             every { getInteger("port") } returns testPort
             every { setBoolean(any(), any()) } returns Unit
             every { setString(any(), any()) } returns Unit
@@ -984,27 +995,831 @@ class ToolsKtTest {
         }
     }
 
+    @Nested
+    inner class ScopeToolsTests {
+        @Test
+        fun `is_in_scope returns true when burp says so`() {
+            val scope = mockk<Scope>()
+            every { api.scope() } returns scope
+            every { scope.isInScope("http://example.com") } returns true
+
+            runBlocking {
+                val result = client.callTool("is_in_scope", mapOf("url" to "http://example.com"))
+                delay(100)
+                result.expectTextContent("true")
+            }
+
+            verify(exactly = 1) { scope.isInScope("http://example.com") }
+        }
+
+        @Test
+        fun `include_in_scope adds the url when config editing is enabled`() {
+            val scope = mockk<Scope>()
+            every { api.scope() } returns scope
+            every { scope.includeInScope(any()) } just runs
+
+            runBlocking {
+                val result = client.callTool("include_in_scope", mapOf("url" to "http://example.com"))
+                delay(100)
+                result.expectTextContent("Included in scope: http://example.com")
+            }
+
+            verify(exactly = 1) { scope.includeInScope("http://example.com") }
+        }
+
+        @Test
+        fun `include_in_scope refuses when config editing is disabled`() {
+            val scope = mockk<Scope>(relaxed = true)
+            every { api.scope() } returns scope
+            every { config.configEditingTooling } returns false
+
+            runBlocking {
+                val result = client.callTool("include_in_scope", mapOf("url" to "http://example.com"))
+                delay(100)
+                result.expectTextContent(
+                    "User has disabled configuration editing. They can enable it in the MCP tab in Burp by selecting 'Enable tools that can edit your config'"
+                )
+            }
+
+            verify(exactly = 0) { scope.includeInScope(any()) }
+        }
+
+        @Test
+        fun `exclude_from_scope removes the url when config editing is enabled`() {
+            val scope = mockk<Scope>()
+            every { api.scope() } returns scope
+            every { scope.excludeFromScope(any()) } just runs
+
+            runBlocking {
+                val result = client.callTool("exclude_from_scope", mapOf("url" to "http://example.com"))
+                delay(100)
+                result.expectTextContent("Excluded from scope: http://example.com")
+            }
+
+            verify(exactly = 1) { scope.excludeFromScope("http://example.com") }
+        }
+    }
+
+    @Nested
+    inner class ScannerToolsTests {
+        private val scanner = mockk<Scanner>()
+
+        @BeforeEach
+        fun setupPro() {
+            mockkStatic(CrawlConfiguration::class)
+            mockkStatic(AuditConfiguration::class)
+
+            val burpSuite = mockk<burp.api.montoya.burpsuite.BurpSuite>()
+            val version = mockk<burp.api.montoya.core.Version>()
+            every { api.burpSuite() } returns burpSuite
+            every { burpSuite.version() } returns version
+            every { version.edition() } returns BurpSuiteEdition.PROFESSIONAL
+            every { burpSuite.taskExecutionEngine() } returns mockk(relaxed = true)
+            every { burpSuite.exportProjectOptionsAsJson() } returns "{}"
+            every { burpSuite.exportUserOptionsAsJson() } returns "{}"
+            every { burpSuite.importProjectOptionsFromJson(any()) } just runs
+            every { burpSuite.importUserOptionsFromJson(any()) } just runs
+
+            every { api.scanner() } returns scanner
+
+            serverManager.stop {}
+            serverStarted = false
+            serverManager.start(config) { state ->
+                if (state is ServerState.Running) serverStarted = true
+            }
+
+            runBlocking {
+                var attempts = 0
+                while (!serverStarted && attempts < 30) {
+                    delay(100)
+                    attempts++
+                }
+                if (!serverStarted) throw IllegalStateException("Server failed to start after timeout")
+                client.connectToServer("http://127.0.0.1:${testPort}")
+            }
+        }
+
+        @AfterEach
+        fun cleanupPro() {
+            unmockkStatic(CrawlConfiguration::class)
+            unmockkStatic(AuditConfiguration::class)
+            ScanTaskRegistry.clear()
+        }
+
+        @Test
+        fun `start_crawl registers a task and returns the id`() {
+            val crawl = mockk<Crawl>(relaxed = true)
+            val crawlConfig = mockk<CrawlConfiguration>()
+            every { CrawlConfiguration.crawlConfiguration("http://example.com") } returns crawlConfig
+            every { scanner.startCrawl(crawlConfig) } returns crawl
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_crawl", mapOf(
+                        "seedUrls" to Json.encodeToJsonElement(listOf("http://example.com"))
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"task_id\""), "Response should include a task_id: $text")
+                assertTrue(text.contains("\"kind\":\"CRAWL\""))
+                assertTrue(text.contains("http://example.com"))
+            }
+
+            verify(exactly = 1) { scanner.startCrawl(crawlConfig) }
+            assertEquals(1, ScanTaskRegistry.list().size)
+            assertEquals(ScanTaskKind.CRAWL, ScanTaskRegistry.list().first().kind)
+        }
+
+        @Test
+        fun `start_crawl aborts and does not call scanner when approval is denied`() {
+            val originalHandler = HttpRequestSecurity.approvalHandler
+            val denyingHandler = mockk<UserApprovalHandler>()
+            coEvery { denyingHandler.requestApproval(any(), any(), any(), any(), any()) } returns false
+            HttpRequestSecurity.approvalHandler = denyingHandler
+            every { persistedObject.getBoolean("requireHttpRequestApproval") } returns true
+
+            try {
+                runBlocking {
+                    val result = client.callTool(
+                        "start_crawl", mapOf(
+                            "seedUrls" to Json.encodeToJsonElement(listOf("http://denied.example.com/"))
+                        )
+                    )
+                    delay(100)
+                    val text = result.expectTextContent()
+                    assertTrue(text.contains("Crawl denied"), "Expected denial message, got: $text")
+                }
+
+                verify(exactly = 0) { scanner.startCrawl(any()) }
+                assertEquals(0, ScanTaskRegistry.list().size)
+            } finally {
+                HttpRequestSecurity.approvalHandler = originalHandler
+                every { persistedObject.getBoolean("requireHttpRequestApproval") } returns false
+            }
+        }
+
+        @Test
+        fun `start_crawl deduplicates approval prompts per unique target`() {
+            val originalHandler = HttpRequestSecurity.approvalHandler
+            val handler = mockk<UserApprovalHandler>()
+            coEvery { handler.requestApproval(any(), any(), any(), any(), any()) } returns true
+            HttpRequestSecurity.approvalHandler = handler
+            every { persistedObject.getBoolean("requireHttpRequestApproval") } returns true
+
+            val crawl = mockk<Crawl>(relaxed = true)
+            val crawlConfig = mockk<CrawlConfiguration>()
+            every { CrawlConfiguration.crawlConfiguration(*anyVararg()) } returns crawlConfig
+            every { scanner.startCrawl(crawlConfig) } returns crawl
+
+            try {
+                runBlocking {
+                    client.callTool(
+                        "start_crawl", mapOf(
+                            "seedUrls" to Json.encodeToJsonElement(
+                                listOf(
+                                    "http://example.com/path1",
+                                    "http://example.com/path2",
+                                    "http://example.com/path3"
+                                )
+                            )
+                        )
+                    )
+                    delay(100)
+                }
+
+                coVerify(exactly = 1) {
+                    handler.requestApproval(eq("example.com"), eq(80), any(), any(), any())
+                }
+            } finally {
+                HttpRequestSecurity.approvalHandler = originalHandler
+                every { persistedObject.getBoolean("requireHttpRequestApproval") } returns false
+            }
+        }
+
+        @Test
+        fun `start_crawl deduplicates targets case-insensitively on host`() {
+            val originalHandler = HttpRequestSecurity.approvalHandler
+            val handler = mockk<UserApprovalHandler>()
+            coEvery { handler.requestApproval(any(), any(), any(), any(), any()) } returns true
+            HttpRequestSecurity.approvalHandler = handler
+            every { persistedObject.getBoolean("requireHttpRequestApproval") } returns true
+
+            val crawl = mockk<Crawl>(relaxed = true)
+            val crawlConfig = mockk<CrawlConfiguration>()
+            every { CrawlConfiguration.crawlConfiguration(*anyVararg()) } returns crawlConfig
+            every { scanner.startCrawl(crawlConfig) } returns crawl
+
+            try {
+                runBlocking {
+                    client.callTool(
+                        "start_crawl", mapOf(
+                            "seedUrls" to Json.encodeToJsonElement(
+                                listOf("http://Example.com/a", "http://example.com/b", "http://EXAMPLE.COM/c")
+                            )
+                        )
+                    )
+                    delay(100)
+                }
+
+                coVerify(exactly = 1) {
+                    handler.requestApproval(eq("example.com"), eq(80), any(), any(), any())
+                }
+            } finally {
+                HttpRequestSecurity.approvalHandler = originalHandler
+                every { persistedObject.getBoolean("requireHttpRequestApproval") } returns false
+            }
+        }
+
+        @Test
+        fun `start_crawl rejects non-http schemes`() {
+            runBlocking {
+                val result = client.callTool(
+                    "start_crawl", mapOf(
+                        "seedUrls" to Json.encodeToJsonElement(listOf("file:///etc/passwd"))
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("must use http or https"), "Got: $text")
+            }
+            verify(exactly = 0) { scanner.startCrawl(any()) }
+        }
+
+        @Test
+        fun `start_crawl rejects empty seed urls`() {
+            runBlocking {
+                val result = client.callTool(
+                    "start_crawl", mapOf(
+                        "seedUrls" to Json.encodeToJsonElement(emptyList<String>())
+                    )
+                )
+                delay(100)
+                result.expectTextContent("At least one seed URL is required")
+            }
+
+            verify(exactly = 0) { scanner.startCrawl(any()) }
+            assertEquals(0, ScanTaskRegistry.list().size)
+        }
+
+        @Test
+        fun `start_crawl rejects invalid seed url`() {
+            runBlocking {
+                val result = client.callTool(
+                    "start_crawl", mapOf(
+                        "seedUrls" to Json.encodeToJsonElement(listOf("not a url"))
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.startsWith("Invalid seed URL"), "Got: $text")
+            }
+        }
+
+        @Test
+        fun `start_audit ACTIVE registers an audit and seeds it`() {
+            val audit = mockk<Audit>(relaxed = true)
+            val auditConfig = mockk<AuditConfiguration>()
+            val httpRequest = mockk<HttpRequest>()
+            every { HttpRequest.httpRequest(any(), any<String>()) } returns httpRequest
+            every {
+                AuditConfiguration.auditConfiguration(burp.api.montoya.scanner.BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS)
+            } returns auditConfig
+            every { scanner.startAudit(auditConfig) } returns audit
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_audit", mapOf(
+                        "mode" to "ACTIVE",
+                        "seedRequest" to buildJsonObject {
+                            put("content", "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                            put("targetHostname", "example.com")
+                            put("targetPort", 80)
+                            put("usesHttps", false)
+                        }
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"task_id\""))
+                assertTrue(text.contains("\"kind\":\"AUDIT\""))
+                assertTrue(text.contains("\"mode\":\"ACTIVE\""))
+            }
+
+            verify(exactly = 1) { scanner.startAudit(auditConfig) }
+            verify(exactly = 1) { audit.addRequest(httpRequest) }
+            assertEquals(1, ScanTaskRegistry.list().size)
+            assertEquals(ScanTaskKind.AUDIT, ScanTaskRegistry.list().first().kind)
+        }
+
+        @Test
+        fun `start_audit rejects invalid mode`() {
+            runBlocking {
+                val result = client.callTool(
+                    "start_audit", mapOf(
+                        "mode" to "BOGUS",
+                        "seedRequest" to buildJsonObject {
+                            put("content", "GET / HTTP/1.1\r\n\r\n")
+                            put("targetHostname", "example.com")
+                            put("targetPort", 80)
+                            put("usesHttps", false)
+                        }
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("Invalid mode"))
+            }
+            verify(exactly = 0) { scanner.startAudit(any()) }
+        }
+
+        @Test
+        fun `add_request_to_audit invokes addRequest on the registered audit`() {
+            val audit = mockk<Audit>(relaxed = true)
+            val taskId = ScanTaskRegistry.register(audit)
+            val httpRequest = mockk<HttpRequest>()
+            every { HttpRequest.httpRequest(any(), any<String>()) } returns httpRequest
+
+            runBlocking {
+                val result = client.callTool(
+                    "add_request_to_audit", mapOf(
+                        "taskId" to taskId,
+                        "request" to buildJsonObject {
+                            put("content", "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                            put("targetHostname", "example.com")
+                            put("targetPort", 443)
+                            put("usesHttps", true)
+                        }
+                    )
+                )
+                delay(100)
+                result.expectTextContent("Added request to audit task $taskId")
+            }
+
+            verify(exactly = 1) { audit.addRequest(httpRequest) }
+        }
+
+        @Test
+        fun `add_request_to_audit rejects unknown task id`() {
+            runBlocking {
+                val result = client.callTool(
+                    "add_request_to_audit", mapOf(
+                        "taskId" to "bogus",
+                        "request" to buildJsonObject {
+                            put("content", "GET / HTTP/1.1\r\n\r\n")
+                            put("targetHostname", "example.com")
+                            put("targetPort", 80)
+                            put("usesHttps", false)
+                        }
+                    )
+                )
+                delay(100)
+                result.expectTextContent("Unknown task_id: bogus")
+            }
+        }
+
+        @Test
+        fun `add_request_to_audit rejects when task is a crawl`() {
+            val crawl = mockk<Crawl>(relaxed = true)
+            val taskId = ScanTaskRegistry.register(crawl)
+
+            runBlocking {
+                val result = client.callTool(
+                    "add_request_to_audit", mapOf(
+                        "taskId" to taskId,
+                        "request" to buildJsonObject {
+                            put("content", "GET / HTTP/1.1\r\n\r\n")
+                            put("targetHostname", "example.com")
+                            put("targetPort", 80)
+                            put("usesHttps", false)
+                        }
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("CRAWL task, not an AUDIT"), "Got: $text")
+            }
+        }
+
+        @Test
+        fun `get_scan_task_status reports audit progress and issues count`() {
+            val audit = mockk<Audit>(relaxed = true)
+            every { audit.requestCount() } returns 42
+            every { audit.errorCount() } returns 1
+            every { audit.statusMessage() } returns "Auditing /api"
+            every { audit.insertionPointCount() } returns 7
+            every { audit.issues() } returns emptyList()
+            val taskId = ScanTaskRegistry.register(audit)
+
+            runBlocking {
+                val result = client.callTool("get_scan_task_status", mapOf("taskId" to taskId))
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"kind\":\"AUDIT\""))
+                assertTrue(text.contains("\"requestCount\":42"))
+                assertTrue(text.contains("\"errorCount\":1"))
+                assertTrue(text.contains("\"statusMessage\":\"Auditing /api\""))
+                assertTrue(text.contains("\"insertionPointCount\":7"))
+                assertTrue(text.contains("\"issuesFound\":0"))
+            }
+        }
+
+        @Test
+        fun `get_scan_task_status reports crawl progress without audit fields`() {
+            val crawl = mockk<Crawl>(relaxed = true)
+            every { crawl.requestCount() } returns 100
+            every { crawl.errorCount() } returns 2
+            val taskId = ScanTaskRegistry.register(crawl)
+
+            runBlocking {
+                val result = client.callTool("get_scan_task_status", mapOf("taskId" to taskId))
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"kind\":\"CRAWL\""))
+                assertTrue(text.contains("\"requestCount\":100"))
+                assertFalse(text.contains("\"insertionPointCount\""), "Crawls should not have insertionPointCount: $text")
+                assertFalse(text.contains("\"issues\""), "Crawls should not have issues: $text")
+            }
+        }
+
+        @Test
+        fun `get_scan_task_status survives accessor exceptions on running audit`() {
+            val audit = mockk<Audit>(relaxed = true)
+            every { audit.requestCount() } returns 163
+            every { audit.errorCount() } returns 0
+            every { audit.statusMessage() } throws UnsupportedOperationException("Currently unsupported.")
+            every { audit.insertionPointCount() } throws UnsupportedOperationException("Currently unsupported.")
+            every { audit.issues() } throws UnsupportedOperationException("Currently unsupported.")
+            val taskId = ScanTaskRegistry.register(audit)
+
+            runBlocking {
+                val result = client.callTool("get_scan_task_status", mapOf("taskId" to taskId))
+                delay(100)
+                val text = result.expectTextContent()
+                assertFalse(text.startsWith("Error:"), "Should not throw out to mcpTool catch: $text")
+                assertTrue(text.contains("\"requestCount\":163"), "Got: $text")
+                assertTrue(text.contains("\"kind\":\"AUDIT\""))
+                assertFalse(text.contains("\"statusMessage\""), "Failed accessor should be omitted: $text")
+                assertFalse(text.contains("\"insertionPointCount\""), "Failed accessor should be omitted: $text")
+                assertFalse(text.contains("\"issuesFound\""), "Failed accessor should be omitted: $text")
+            }
+        }
+
+        @Test
+        fun `get_scan_task_status returns unknown for unknown id`() {
+            runBlocking {
+                val result = client.callTool("get_scan_task_status", mapOf("taskId" to "bogus"))
+                delay(100)
+                result.expectTextContent("Unknown task_id: bogus")
+            }
+        }
+
+        @Test
+        fun `list_scan_tasks returns registered tasks`() {
+            val crawl = mockk<Crawl>(relaxed = true)
+            val audit = mockk<Audit>(relaxed = true)
+            every { crawl.requestCount() } returns 10
+            every { crawl.errorCount() } returns 0
+            every { audit.requestCount() } returns 5
+            every { audit.errorCount() } returns 0
+            ScanTaskRegistry.register(crawl)
+            ScanTaskRegistry.register(audit)
+
+            runBlocking {
+                val result = client.callTool(
+                    "list_scan_tasks", mapOf("count" to 10, "offset" to 0)
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"kind\":\"CRAWL\""))
+                assertTrue(text.contains("\"kind\":\"AUDIT\""))
+            }
+        }
+
+        @Test
+        fun `cancel_scan_task deletes the task and removes it from the registry`() {
+            val audit = mockk<Audit>(relaxed = true)
+            val taskId = ScanTaskRegistry.register(audit)
+
+            runBlocking {
+                val result = client.callTool("cancel_scan_task", mapOf("taskId" to taskId))
+                delay(100)
+                result.expectTextContent("Cancelled AUDIT task $taskId")
+            }
+
+            verify(exactly = 1) { audit.delete() }
+            assertNull(ScanTaskRegistry.get(taskId))
+        }
+
+        @Test
+        fun `cancel_scan_task returns unknown for missing id`() {
+            runBlocking {
+                val result = client.callTool("cancel_scan_task", mapOf("taskId" to "bogus"))
+                delay(100)
+                result.expectTextContent("Unknown task_id: bogus")
+            }
+        }
+
+        @Test
+        fun `cancel_scan_task surfaces delete failures and keeps the task in the registry`() {
+            val audit = mockk<Audit>(relaxed = true)
+            every { audit.delete() } throws RuntimeException("burp boom")
+            val taskId = ScanTaskRegistry.register(audit)
+
+            runBlocking {
+                val result = client.callTool("cancel_scan_task", mapOf("taskId" to taskId))
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.startsWith("Failed to cancel task"), "Got: $text")
+                assertTrue(text.contains("burp boom"), "Should include underlying error: $text")
+            }
+
+            assertNotNull(ScanTaskRegistry.get(taskId), "Failed cancellation must keep task in registry for retry")
+        }
+
+        @Test
+        fun `describe_audit_modes returns documented mode descriptions`() {
+            runBlocking {
+                val result = client.callTool("describe_audit_modes", emptyMap())
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"ACTIVE\""), "Should describe ACTIVE mode: $text")
+                assertTrue(text.contains("\"PASSIVE\""), "Should describe PASSIVE mode: $text")
+                assertTrue(text.contains("LEGACY_ACTIVE_AUDIT_CHECKS"))
+                assertTrue(text.contains("LEGACY_PASSIVE_AUDIT_CHECKS"))
+                assertTrue(text.contains("notSupportedByMontoyaApi"), "Should document API limitations")
+                assertTrue(text.contains("severityValues"))
+            }
+        }
+
+        @Test
+        fun `get_scanner_configuration returns scanner-shaped slice from project options`() {
+            val burpSuite = mockk<burp.api.montoya.burpsuite.BurpSuite>()
+            val version = mockk<burp.api.montoya.core.Version>()
+            every { api.burpSuite() } returns burpSuite
+            every { burpSuite.version() } returns version
+            every { version.edition() } returns BurpSuiteEdition.PROFESSIONAL
+            every { burpSuite.taskExecutionEngine() } returns mockk(relaxed = true)
+            every { burpSuite.exportProjectOptionsAsJson() } returns
+                """{"scanner":{"audit_options":{"max_concurrent_requests":10}},""" +
+                """"proxy":{"intercept_on":false},""" +
+                """"user":{"display":{"theme":"dark"}}}"""
+
+            runBlocking {
+                val result = client.callTool("get_scanner_configuration", emptyMap())
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"scanner\""), "Should include scanner: $text")
+                assertTrue(text.contains("\"proxy\""), "Should include proxy: $text")
+                assertTrue(text.contains("\"audit_options\""))
+                assertFalse(text.contains("\"user\""), "Should NOT include user: $text")
+            }
+        }
+
+        @Test
+        fun `get_scanner_configuration falls back when scanner subtree absent`() {
+            val burpSuite = mockk<burp.api.montoya.burpsuite.BurpSuite>()
+            val version = mockk<burp.api.montoya.core.Version>()
+            every { api.burpSuite() } returns burpSuite
+            every { burpSuite.version() } returns version
+            every { version.edition() } returns BurpSuiteEdition.PROFESSIONAL
+            every { burpSuite.taskExecutionEngine() } returns mockk(relaxed = true)
+            every { burpSuite.exportProjectOptionsAsJson() } returns
+                """{"unrelated":{"foo":"bar"}}"""
+
+            runBlocking {
+                val result = client.callTool("get_scanner_configuration", emptyMap())
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("No scanner-shaped subtree"), "Should report fallback: $text")
+                assertTrue(text.contains("\"unrelated\""), "Should include raw JSON: $text")
+            }
+        }
+
+        @Test
+        fun `get_scanner_issues filters by host case-insensitively when host is provided`() {
+            val siteMap = mockk<burp.api.montoya.sitemap.SiteMap>()
+            val issueA = mockk<burp.api.montoya.scanner.audit.issues.AuditIssue>(relaxed = true)
+            val issueB = mockk<burp.api.montoya.scanner.audit.issues.AuditIssue>(relaxed = true)
+            val httpServiceA = mockk<burp.api.montoya.http.HttpService>()
+            val httpServiceB = mockk<burp.api.montoya.http.HttpService>()
+            every { httpServiceA.host() } returns "app.polifrete.com"
+            every { httpServiceA.port() } returns 443
+            every { httpServiceA.secure() } returns true
+            every { httpServiceB.host() } returns "samsungtv.travelchannel.com"
+            every { httpServiceB.port() } returns 80
+            every { httpServiceB.secure() } returns false
+            every { issueA.httpService() } returns httpServiceA
+            every { issueB.httpService() } returns httpServiceB
+            every { issueA.name() } returns "Issue on polifrete"
+            every { issueB.name() } returns "Issue on samsungtv"
+            every { issueA.detail() } returns null
+            every { issueB.detail() } returns null
+            every { issueA.remediation() } returns null
+            every { issueB.remediation() } returns null
+            every { issueA.baseUrl() } returns "https://app.polifrete.com/"
+            every { issueB.baseUrl() } returns "http://samsungtv.travelchannel.com/"
+            every { issueA.severity() } returns burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.LOW
+            every { issueB.severity() } returns burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.MEDIUM
+            every { issueA.confidence() } returns burp.api.montoya.scanner.audit.issues.AuditIssueConfidence.CERTAIN
+            every { issueB.confidence() } returns burp.api.montoya.scanner.audit.issues.AuditIssueConfidence.CERTAIN
+            every { issueA.requestResponses() } returns emptyList()
+            every { issueB.requestResponses() } returns emptyList()
+            every { issueA.collaboratorInteractions() } returns emptyList()
+            every { issueB.collaboratorInteractions() } returns emptyList()
+            val def = mockk<burp.api.montoya.scanner.audit.issues.AuditIssueDefinition>()
+            every { def.name() } returns "id"
+            every { def.background() } returns null
+            every { def.remediation() } returns null
+            every { def.typeIndex() } returns 0
+            every { issueA.definition() } returns def
+            every { issueB.definition() } returns def
+
+            every { api.siteMap() } returns siteMap
+            every { siteMap.issues() } returns listOf(issueA, issueB)
+
+            runBlocking {
+                val unfiltered = client.callTool(
+                    "get_scanner_issues", mapOf("count" to 50, "offset" to 0)
+                )
+                delay(100)
+                val unfilteredText = unfiltered.expectTextContent()
+                assertTrue(unfilteredText.contains("polifrete"), "Unfiltered should include both: $unfilteredText")
+                assertTrue(unfilteredText.contains("samsungtv"), "Unfiltered should include both: $unfilteredText")
+
+                val filtered = client.callTool(
+                    "get_scanner_issues",
+                    mapOf("count" to 50, "offset" to 0, "host" to "APP.POLIFRETE.COM")
+                )
+                delay(100)
+                val filteredText = filtered.expectTextContent()
+                assertTrue(filteredText.contains("polifrete"), "Filtered should include polifrete: $filteredText")
+                assertFalse(filteredText.contains("samsungtv"), "Filtered should exclude samsungtv: $filteredText")
+            }
+        }
+
+        @Test
+        fun `get_scanner_issues filters by minSeverity returning issues at or above the threshold`() {
+            val siteMap = mockk<burp.api.montoya.sitemap.SiteMap>()
+            fun mkIssue(name: String, sev: burp.api.montoya.scanner.audit.issues.AuditIssueSeverity): burp.api.montoya.scanner.audit.issues.AuditIssue {
+                val issue = mockk<burp.api.montoya.scanner.audit.issues.AuditIssue>(relaxed = true)
+                val service = mockk<burp.api.montoya.http.HttpService>()
+                every { service.host() } returns "target.example.com"
+                every { service.port() } returns 443
+                every { service.secure() } returns true
+                every { issue.httpService() } returns service
+                every { issue.name() } returns name
+                every { issue.detail() } returns null
+                every { issue.remediation() } returns null
+                every { issue.baseUrl() } returns "https://target.example.com/"
+                every { issue.severity() } returns sev
+                every { issue.confidence() } returns burp.api.montoya.scanner.audit.issues.AuditIssueConfidence.CERTAIN
+                every { issue.requestResponses() } returns emptyList()
+                every { issue.collaboratorInteractions() } returns emptyList()
+                val def = mockk<burp.api.montoya.scanner.audit.issues.AuditIssueDefinition>()
+                every { def.name() } returns "id"
+                every { def.background() } returns null
+                every { def.remediation() } returns null
+                every { def.typeIndex() } returns 0
+                every { issue.definition() } returns def
+                return issue
+            }
+            val high = mkIssue("HighFinding", burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.HIGH)
+            val med = mkIssue("MediumFinding", burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.MEDIUM)
+            val low = mkIssue("LowFinding", burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.LOW)
+            val info = mkIssue("InfoFinding", burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.INFORMATION)
+
+            every { api.siteMap() } returns siteMap
+            every { siteMap.issues() } returns listOf(info, low, med, high)
+
+            runBlocking {
+                val mediumPlus = client.callTool(
+                    "get_scanner_issues", mapOf("count" to 50, "offset" to 0, "minSeverity" to "MEDIUM")
+                )
+                delay(100)
+                val text = mediumPlus.expectTextContent()
+                assertTrue(text.contains("HighFinding"), "Should include HIGH: $text")
+                assertTrue(text.contains("MediumFinding"), "Should include MEDIUM: $text")
+                assertFalse(text.contains("LowFinding"), "Should exclude LOW: $text")
+                assertFalse(text.contains("InfoFinding"), "Should exclude INFORMATION: $text")
+
+                val highOnly = client.callTool(
+                    "get_scanner_issues", mapOf("count" to 50, "offset" to 0, "minSeverity" to "high")
+                )
+                delay(100)
+                val highText = highOnly.expectTextContent()
+                assertTrue(highText.contains("HighFinding"), "Case-insensitive minSeverity should work: $highText")
+                assertFalse(highText.contains("MediumFinding"), "high-only should exclude MEDIUM: $highText")
+            }
+        }
+
+        @Test
+        fun `get_scanner_issues rejects invalid minSeverity with clear error`() {
+            val siteMap = mockk<burp.api.montoya.sitemap.SiteMap>()
+            every { api.siteMap() } returns siteMap
+            every { siteMap.issues() } returns emptyList()
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_scanner_issues", mapOf("count" to 50, "offset" to 0, "minSeverity" to "CRITICAL")
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.startsWith("Invalid minSeverity 'CRITICAL'"), "Got: $text")
+                assertTrue(text.contains("HIGH, MEDIUM, LOW"), "Should list valid values: $text")
+            }
+        }
+
+        @Test
+        fun `get_scanner_issues with host filter and no matches returns end-of-items`() {
+            val siteMap = mockk<burp.api.montoya.sitemap.SiteMap>()
+            val issue = mockk<burp.api.montoya.scanner.audit.issues.AuditIssue>(relaxed = true)
+            val service = mockk<burp.api.montoya.http.HttpService>()
+            every { service.host() } returns "other.example.com"
+            every { service.port() } returns 443
+            every { service.secure() } returns true
+            every { issue.httpService() } returns service
+            every { api.siteMap() } returns siteMap
+            every { siteMap.issues() } returns listOf(issue)
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_scanner_issues",
+                    mapOf("count" to 50, "offset" to 0, "host" to "no-such-host.example.com")
+                )
+                delay(100)
+                result.expectTextContent("Reached end of items")
+            }
+        }
+
+        @Test
+        fun `start_audit cleans up and reports error if addRequest throws`() {
+            val audit = mockk<Audit>(relaxed = true)
+            val auditConfig = mockk<AuditConfiguration>()
+            val httpRequest = mockk<HttpRequest>()
+            every { HttpRequest.httpRequest(any(), any<String>()) } returns httpRequest
+            every {
+                AuditConfiguration.auditConfiguration(burp.api.montoya.scanner.BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS)
+            } returns auditConfig
+            every { scanner.startAudit(auditConfig) } returns audit
+            every { audit.addRequest(httpRequest) } throws RuntimeException("seed boom")
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_audit", mapOf(
+                        "mode" to "ACTIVE",
+                        "seedRequest" to buildJsonObject {
+                            put("content", "GET / HTTP/1.1\r\n\r\n")
+                            put("targetHostname", "example.com")
+                            put("targetPort", 80)
+                            put("usesHttps", false)
+                        }
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.startsWith("Failed to seed audit"), "Got: $text")
+                assertTrue(text.contains("seed boom"))
+            }
+
+            verify(exactly = 1) { audit.delete() }
+            assertEquals(0, ScanTaskRegistry.list().size, "Failed audit must not leak into registry")
+        }
+    }
+
     @Test
     fun `tool name conversion should work properly`() {
         assertEquals("send_http1_request", "SendHttp1Request".toLowerSnakeCase())
         assertEquals("test_case_conversion", "TestCaseConversion".toLowerSnakeCase())
         assertEquals("multiple_upper_case_letters", "MultipleUpperCaseLetters".toLowerSnakeCase())
     }
-    
+
     @Test
     fun `edition specific tools should only register in professional edition`() {
         val burpSuite = mockk<burp.api.montoya.burpsuite.BurpSuite>()
         val version = mockk<burp.api.montoya.core.Version>()
-        
+
         every { api.burpSuite() } returns burpSuite
         every { burpSuite.version() } returns version
-        
+
         every { version.edition() } returns BurpSuiteEdition.COMMUNITY_EDITION
         runBlocking {
             val tools = client.listTools()
             assertFalse(tools.any { it.name == "get_scanner_issues" })
             assertFalse(tools.any { it.name == "generate_collaborator_payload" })
             assertFalse(tools.any { it.name == "get_collaborator_interactions" })
+            assertFalse(tools.any { it.name == "start_crawl" })
+            assertFalse(tools.any { it.name == "start_audit" })
+            assertFalse(tools.any { it.name == "add_request_to_audit" })
+            assertFalse(tools.any { it.name == "get_scan_task_status" })
+            assertFalse(tools.any { it.name == "list_scan_tasks" })
+            assertFalse(tools.any { it.name == "cancel_scan_task" })
+            assertFalse(tools.any { it.name == "describe_audit_modes" })
+            assertFalse(tools.any { it.name == "get_scanner_configuration" })
+
+            assertTrue(tools.any { it.name == "is_in_scope" })
+            assertTrue(tools.any { it.name == "include_in_scope" })
+            assertTrue(tools.any { it.name == "exclude_from_scope" })
         }
 
         every { version.edition() } returns BurpSuiteEdition.PROFESSIONAL
@@ -1029,6 +1844,14 @@ class ToolsKtTest {
             assertTrue(tools.any { it.name == "get_scanner_issues" })
             assertTrue(tools.any { it.name == "generate_collaborator_payload" })
             assertTrue(tools.any { it.name == "get_collaborator_interactions" })
+            assertTrue(tools.any { it.name == "start_crawl" })
+            assertTrue(tools.any { it.name == "start_audit" })
+            assertTrue(tools.any { it.name == "add_request_to_audit" })
+            assertTrue(tools.any { it.name == "get_scan_task_status" })
+            assertTrue(tools.any { it.name == "list_scan_tasks" })
+            assertTrue(tools.any { it.name == "cancel_scan_task" })
+            assertTrue(tools.any { it.name == "describe_audit_modes" })
+            assertTrue(tools.any { it.name == "get_scanner_configuration" })
         }
     }
 }

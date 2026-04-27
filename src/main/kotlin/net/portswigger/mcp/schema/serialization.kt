@@ -193,3 +193,22 @@ data class CollaboratorSmtpDetails(
     val protocol: String,
     val conversation: String
 )
+
+@Serializable
+data class ScanTaskStatus(
+    val taskId: String,
+    val kind: String,
+    val requestCount: Int,
+    val errorCount: Int,
+    val statusMessage: String? = null,
+    val insertionPointCount: Int? = null,
+    val issuesFound: Int? = null
+)
+
+@Serializable
+data class ScanTaskSummary(
+    val taskId: String,
+    val kind: String,
+    val requestCount: Int,
+    val errorCount: Int
+)
